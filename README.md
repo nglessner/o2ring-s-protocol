@@ -16,6 +16,19 @@ Wellue calls "OxyII" internally. Every existing open-source O2Ring tool
 `ecostech/viatom-ble`) targets the legacy service and silently fails
 against the T8520.
 
+This document is a partial answer to
+[MackeyStingray/o2r#5](https://github.com/MackeyStingray/o2r/issues/5),
+open since 2025-10-16.
+
+> **Provided for educational and interoperability purposes.**
+> This documentation describes a Bluetooth LE protocol implemented by
+> a device the author legally owns. It is published to enable
+> interoperability with software the device-owner runs on their own
+> systems, consistent with 17 U.S.C. § 1201(f) and equivalent
+> provisions elsewhere. The author is not affiliated with Shenzhen
+> Viatom Technology or Wellue. "O2Ring," "Wellue," "Viatom," and
+> related marks are property of their respective owners.
+
 ## Status
 
 | Capability | Status |
@@ -156,7 +169,7 @@ def crc8(data: bytes) -> int:
     return crc
 ```
 
-A common mistake is to use XOR instead — that
+A common mistake (one this author made) is to use XOR instead — that
 matches the legacy O2Ring's checksum, not OxyII. The two are completely
 different. Verify your CRC against this 5-byte fixture:
 
