@@ -121,6 +121,41 @@ btmon or Wireshark that an `ATT Exchange MTU Request` packet is on the
 wire shortly after the LE connection is established. If it isn't,
 file-transfer commands will fail silently.
 
+#### Empirical confirmation and a firmware-variant nuance
+
+The "silent drop" mechanism was confirmed on firmware `2D010002` via
+a control test that connected to the ring without issuing
+`ATT Exchange MTU Request`. With the MTU left at the default 23:
+
+- `cmd=0x10`, `cmd=0xC0`, `cmd=0x00`, and `cmd=0xF1` all returned full
+  replies — including a 48-byte `cmd=0x00` fingerprint frame and a
+  73-byte `cmd=0xF1 GET_FILE_LIST` frame for four files. So
+  notifications larger than the 20-byte ATT cap are reassembled
+  transparently by BlueZ/Bumble above the ATT layer; "MTU=23 truncates
+  big replies" is **not** the gating mechanism.
+- `cmd=0xF2 READ_FILE_START` produced literal zero bytes for all four
+  files within a four-second window — not a partial buffer, not a
+  truncated reply. The ring is silent. Whatever check Wellue's firmware
+  does at the F2 entry point, it gates on something MTU- or
+  DLE-related at the link/ATT layer that satisfies a 517-byte
+  exchange but not a 23-byte one. F2's *own* reply is small enough
+  to fit either way — the gate appears to anticipate the 512-byte F3
+  chunks that follow.
+
+A field report on firmware `2D010003`
+([issue #1](https://github.com/nglessner/o2ring-s-protocol/issues/1))
+describes a different gate: `cmd=0xF2` succeeds at MTU=23 there, and
+`cmd=0xF3` chunks reassemble fine via BlueZ; the cap on that firmware
+manifests as a per-BLE-connection F3 throughput limit (the budget runs
+out mid-transfer; reconnect-and-resume completes the file). The two
+observations are not necessarily contradictory — the F2 gate may have
+been relaxed between `2D010002` and `2D010003`, with a separate per-
+connection budget always present and only visible once F2 is no
+longer the blocker.
+
+Practically, requesting MTU=517 immediately after connect is the
+universally workable path on every firmware tested so far.
+
 ### Notification framing
 
 When MTU is 517, every reply observed in this protocol fits in a single
