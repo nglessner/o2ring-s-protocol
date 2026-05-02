@@ -421,6 +421,15 @@ both.
 `cmd=0xE1` GET_INFO can be issued at any point in the flow without
 disrupting state.
 
+The 40-byte plaintext reply to `cmd=0x00` should be consumed before
+entering the F3 read-loop. Implementations that send `cmd=0xF2` and
+`cmd=0x00` concurrently and then loop on `cmd=0xF3` have been observed
+mistaking the 40-byte reply for an F3 chunk with `block_len=40`. The
+underlying transfer still completes (the reply lands at file offset 0
+and gets overwritten by F3 chunks starting at offset 40), but it's a
+confusing edge case worth avoiding by ordering the post-auth handshake
+strictly before the file-transfer loop.
+
 ## Stored-file format
 
 Two SpO2-recording formats are seen in the wild from this device family:
@@ -443,6 +452,57 @@ Body (3 bytes per record):
 The `04 00` at offset 8–9 of the header appears to be the sample
 interval in some unit (possibly tenths-of-a-second), but values other
 than `04 00` haven't been observed.
+
+#### Trailer (48 bytes)
+
+Every finalised Format A file ends with a 48-byte session-stats trailer
+that the vendor app uses for its session-summary PDF. Field offsets are
+relative to the start of the trailer (`file_size − 48`).
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–3   | 4  | opaque per-recording bytes (variable across files; byte 3 always `0x00`; likely a hash or per-recording id) |
+| 4–7   | 4  | sub-magic `48 12 5a da` |
+| 8–9   | 2  | opaque per-recording bytes (variable) |
+| 10–11 | 2  | u16 LE counter — increments occasionally; **not** strictly per-recording (see below) |
+| 12–13 | 2  | u16 LE — total samples = total seconds of the recording |
+| 14–15 | 2  | reserved (always `0x00 0x00`; consistent with bytes 12–15 forming a u32 sample count) |
+| 16–18 | 3  | format-version stamp `01 01 03` |
+| 19–33 | 15 | reserved (zero) |
+| 34    | 1  | avg SpO₂ (rounded integer) |
+| 35    | 1  | min SpO₂ (matches body-min byte-exact) |
+| 36    | 1  | count of desats ≥ 3% |
+| 37    | 1  | count of desats ≥ 4% |
+| 38    | 1  | reserved (zero) |
+| 39–40 | 2  | u16 LE — total seconds with SpO₂ < 90% |
+| 41    | 1  | distinct desat episodes < 90% |
+| 42    | 1  | O₂ Score × 10 (`0xFF` = N/A; e.g. on short sessions) |
+| 43–46 | 4  | reserved (zero) |
+| 47    | 1  | avg HR (rounded integer) |
+
+This mapping was contributed by `@knifebunny` in
+[issue #1](https://github.com/nglessner/o2ring-s-protocol/issues/1)
+(firmware `2D010003`) with cross-validation work by Ilya across 27
+vendor-app PDF exports. Verified independently against eight separate
+recordings on this author's `2D010002` ring: sub-magic offset,
+total-samples, format stamp, min-SpO₂, drop counts, and N/A
+score-x10 are byte-exact; avg-SpO₂ and avg-HR agree with body-derived
+means within ±1.
+
+**On the offset-10 counter.** The originating report describes it as
+"monotonic per recording." On the verification captures used here it
+incremented exactly once across eight recordings spanning twenty-two
+hours, staying flat across seven back-to-back recordings within a
+single day. The likeliest interpretation is a per-power-on or per-wake
+counter rather than a recording id. Use it as a non-decreasing
+clustering hint, not as a unique recording key.
+
+**Anchor as the finalisation predicate.** The ring will sometimes
+report a file's full byte count via `cmd=0xF2` *before* the trailer
+has flushed. Size-equality alone is not a reliable "this file is
+complete" check — the presence of the `48 12 5a da` sub-magic at
+`file_size − 44` is. Files that hit full size without the anchor
+should be re-pulled in a later sync cycle.
 
 ### Format B: v3 (.vld)
 
