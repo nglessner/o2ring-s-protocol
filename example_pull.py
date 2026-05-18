@@ -210,8 +210,12 @@ async def session(device: Device, addr: str) -> int:
         await request(write_ch, inbox, 0x10, b"\x00", seq=0)
         await request(write_ch, inbox, 0xC0, build_set_utc_time_payload(), seq=1)
         await request(write_ch, inbox, 0x00, b"", seq=1)
+        # Clear any phantom file handle left open by the ring's own
+        # recording; otherwise cmd=0xF1 below silently times out. F4 is
+        # a no-op when nothing is open, so unconditional is safe.
+        await request(write_ch, inbox, 0xF4, b"", seq=2, reply_timeout=2.0)
 
-        result = await request(write_ch, inbox, 0xF1, b"", seq=2)
+        result = await request(write_ch, inbox, 0xF1, b"", seq=3)
         if result is None:
             print("GET_FILE_LIST failed")
             return 1
@@ -222,7 +226,7 @@ async def session(device: Device, addr: str) -> int:
             print(f"  {f.name}")
 
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        seq = 3
+        seq = 4
         for fentry in listing.files:
             print(f"\nopening {fentry.name}")
             result = await request(

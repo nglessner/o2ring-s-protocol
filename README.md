@@ -41,10 +41,12 @@ open since 2025-10-16.
 | READ_FILE (start / data / end) | Verified, byte-equivalent to ViHealth export |
 | Live SpO2 + HR stream | Verified |
 | `cmd=0xFF` auth derivation | Verified (algorithm reproduced from scratch) |
-| `cmd=0x00`, `cmd=0x10` setup steps | Send-and-ack only, exact purpose unknown |
-| GET_CONFIG / SET_CONFIG | Documented in vendor SDK; not yet exercised |
+| `cmd=0x10` setup step | Send-and-ack only, exact purpose unknown |
+| GET_CONFIG / SET_CONFIG | Verified (plaintext on this firmware; AES path unused) |
 | Real-time waveform / PPG | Documented; not yet exercised |
-| Factory reset / OTA | Documented; not yet exercised |
+| FACTORY_RESET (`cmd=0xE3`) | Verified — wipes settings AND recordings (no settings-only path) |
+| FACTORY_RESET_ALL (`cmd=0xEE`) | Verified — powers ring off, needs USB to wake; do not issue |
+| OTA | Documented; not yet exercised |
 
 End-to-end byte equivalence between BLE-pulled files and the vendor
 app's USB export was verified via SHA-256 across two real recordings
@@ -219,12 +221,15 @@ command is sent either plaintext or with its payload AES-128-ECB-PKCS7
 encrypted. The frame envelope (header + CRC) is computed over whatever
 payload bytes (plaintext or ciphertext) end up on the wire.
 
-In practice, almost every command in this protocol is sent **plaintext**.
-The only exception observed in vendor traffic is `cmd=0xFF`, which is a
-one-way auth/handshake message and uses a XOR scheme rather than AES.
-GET_CONFIG / SET_CONFIG and a few other administrative commands may use
-AES with a derived session key; this hasn't been exercised end-to-end
-yet.
+In practice, every command verified against the T8520 is sent
+**plaintext**, including GET_CONFIG / SET_CONFIG. The only exception
+is `cmd=0xFF`, a one-way auth/handshake message that uses a XOR scheme
+rather than AES. The vendor SDK has AES paths for SET_CONFIG and a few
+other administrative commands, but they only activate when `cmd=0xFF`
+returns a session key — which T8520 firmware `2D010001` (and, per the
+upstream author's captures, `2D010002`) never does, so the SDK's
+plaintext fallback is what ends up on the wire. Other firmware variants
+may behave differently.
 
 ### `cmd=0xFF` authentication
 
@@ -295,14 +300,17 @@ Key is always 16 bytes. PKCS7 padding. ECB mode (no IV).
 
 | Opcode | Name | Payload | Reply | Notes |
 |---|---|---|---|---|
-| `0x00` | (setup) | empty | 40 bytes plaintext | Per-device fingerprint constant; byte-identical across sessions on a given device. |
-| `0x03` | LIVE_SAMPLES_A | empty | 6-byte header + ≤250 samples | Live SpO2/HR stream, ~1 sample/sec. |
-| `0x04` | LIVE_SAMPLES_B | empty | 24-byte header + 2-byte count + samples | Same data as 0x03; what the vendor app uses. Do not call before `cmd=0xF2` in a file-transfer flow — appears to put the ring in a "live streaming" state that gates out file commands. |
+| `0x00` | GET_CONFIG | empty | 40 bytes plaintext | Ring settings struct (brightness, alarms, motor, etc). See section below. The reply is stable across sessions on a given device only because settings don't change unless you flip them in the vendor app. |
+| `0x01` | SET_CONFIG | 8 bytes plaintext | ack | Writes one field of the settings struct. See section below. |
+| `0x03` | LIVE_SAMPLES_A | empty | 6-byte header + N bytes | Real-time PPG waveform, ~100 samples/sec. Header is `00 00 00 00 <count_lo> <count_hi>`. No parsed SpO₂/HR. |
+| `0x04` | LIVE_SAMPLES_B | empty | 24-byte header + 2-byte count + N bytes | 24-byte header carries the parsed live SpO₂ / HR / motion / battery (see section below). Body is the same ~100 Hz PPG waveform as `0x03`. Do not call before `cmd=0xF2` in a file-transfer flow — puts the ring in a state that gates out file commands until disconnect. |
 | `0x05` | (history?) | empty | 922 bytes | u8 count + 102 × 9-byte records, each starting `03 00 ...`. Live (changes per call). Purpose unknown. |
 | `0x10` | (setup) | 1 byte `0x00` | 0-byte ack | Required in the post-auth handshake. Purpose unknown. |
 | `0xC0` | SET_UTC_TIME | 8 bytes (see below) | ack | Sets the ring's RTC. |
 | `0xE1` | GET_INFO | empty | 60 bytes plaintext | Serial, firmware version, datetime, etc. |
+| `0xE3` | FACTORY_RESET | empty | empty ack (sometimes drops link) | Wipes settings AND every recording on flash — no settings-only path. The vendor app's "Restore factory settings" button. See section below. |
 | `0xE4` | GET_BATTERY | empty | 4 bytes | Battery level + status. |
+| `0xEE` | FACTORY_RESET_ALL | empty | none | **Do not issue.** Powers the ring off and refuses to re-advertise until woken by USB. See section below. |
 | `0xF1` | GET_FILE_LIST | empty | u8 count + N × 16 bytes | Each slot: 14-byte ASCII timestamp + 2 zero pad. |
 | `0xF2` | READ_FILE_START | 20 bytes (see below) | 4 bytes file size + metadata | Opens a file for reading. Requires MTU ≥ 517. |
 | `0xF3` | READ_FILE_DATA | 4-byte LE offset | up to 512-byte chunk | Loop until empty reply or `offset + len >= file_size`. |
@@ -314,13 +322,10 @@ end-to-end here:
 
 | Opcode (per SDK) | Name | Notes |
 |---|---|---|
-| (not yet captured) | GET_CONFIG | Returns ring settings: brightness mode, buzzer, display mode, HR alarm thresholds, motor (vibration), SpO2 alarm thresholds, recording sample interval. |
-| (not yet captured) | SET_CONFIG | Same fields, write side. |
 | (not yet captured) | GET_RT_PARAM | Real-time parameters (one-shot). |
 | (not yet captured) | GET_RT_WAVE | Real-time waveform stream. |
 | (not yet captured) | GET_RT_PPG | Real-time PPG (raw photoplethysmogram). |
 | (not yet captured) | RESET | Soft reset. |
-| (not yet captured) | FACTORY_RESET_ALL | Wipes pairing + recordings. |
 
 These names correspond to features the vendor app exposes. Their
 opcode bytes and payload layouts will need to be captured from an HCI
@@ -352,6 +357,123 @@ work hasn't been done here.
 Re-implementations should treat any field not listed here as opaque and
 not relied upon. Some ranges may carry data on firmware variants this
 author hasn't tested.
+
+### `GET_CONFIG` (cmd=0x00) reply
+
+Returns the ring's current configuration struct — not a fixed device
+fingerprint, as previously suspected. The reply is 40 bytes; the first
+20 are decoded below. Bytes 20+ have not been characterised; treat as
+opaque.
+
+```
+[0]      u8       packed alarm-routing flags
+                    bit 0  SpO₂ alarm vibrates motor
+                    bit 1  SpO₂ alarm sounds buzzer
+                    bit 4  HR alarm vibrates motor
+                    bit 5  HR alarm sounds buzzer
+[1]      u8       SpO₂ low alarm threshold (percent)
+[2]      u8       HR low alarm threshold (bpm)
+[3]      u8       HR high alarm threshold (bpm)
+[4]      u8       motor (vibration intensity)
+[5]      u8       buzzer (volume level)
+[6]      u8       display mode (orientation / layout enum)
+[7]      u8       brightness mode (enum)
+[8]      u8       storage interval (recording sample period enum)
+[9]      u8       time-zone byte (interpretation unclear)
+[10]     u8       autoSwitch
+[11]     u8       algAvgTime (SpO₂ averaging window)
+[12]     u8       countDownTime
+[13]     u8       lrModel (worn on left vs right hand)
+[14]     u8       motorSwitch
+[15]     u8       motorThr (motion detection threshold)
+[16]     u8       invalidSignalSwitch
+[17..18] u16 LE   invalidSignalTimeThr (seconds)
+[19]     u8       funcSwitch
+[20..]   bytes    reserved / firmware-variant (treat as opaque)
+```
+
+See [`example_config.py`](./example_config.py) for an end-to-end read.
+
+### `SET_CONFIG` (cmd=0x01) payload
+
+8 bytes, little-endian: `[field_index, 0, 0, 0, value, 0, 0, 0]`.
+
+On T8520 firmware `2D010001` the payload goes plaintext.
+The vendor SDK has an AES-128/ECB/PKCS7 path keyed by the AUTH session
+key, but this firmware doesn't reply to AUTH with one, so the SDK's
+fallback (plaintext) is what actually goes on the wire. Sending an
+AES-encrypted payload anyway is silently dropped — the frame acks but
+the value doesn't change.
+
+Field indices are a separate enum from the GET_CONFIG byte offsets
+above. Verified writeable:
+
+| Index | Field          | Notes                                                        |
+|-------|----------------|--------------------------------------------------------------|
+| 1     | SPO2_SWITCH    | toggles motor/buzzer bits in alarm_flags (byte 0)            |
+| 2     | SPO2_LOW       | SpO₂ low alarm threshold (percent)                           |
+| 3     | HR_SWITCH      | toggles motor/buzzer bits in alarm_flags (byte 0)            |
+| 4     | HR_LOW         | HR low alarm threshold (bpm)                                 |
+| 5     | HR_HIGH        | HR high alarm threshold (bpm)                                |
+| 6     | MOTOR          | vibration intensity                                          |
+| 8     | DISPLAY_MODE   | screen layout / orientation enum                             |
+| 9     | BRIGHTNESS     | 0=Low, 1=Medium, 2=High                                      |
+| 10    | INTERVAL       | recording sample period enum                                 |
+
+Value ranges other than brightness aren't documented here — read
+GET_CONFIG before and after a write to discover them empirically. See
+[`example_config.py`](./example_config.py).
+
+### `FACTORY_RESET` (cmd=0xE3)
+
+Empty payload, plaintext. The ring usually returns an empty ack and
+stays connected; sometimes it drops the link as it finishes the wipe.
+Either way, callers should be prepared to re-scan and re-handshake.
+
+What it does on firmware `2D010001`: wipes the settings struct AND
+every stored recording on flash. There is no settings-only
+path — both bits of state always get cleared together, despite the
+naming. This is the opcode behind the vendor app's user-facing
+"Restore factory settings" button.
+
+### `FACTORY_RESET_ALL` (cmd=0xEE) — do not issue
+
+Empty payload, no reply. Observed against firmware `2D010001`: the
+ring powers itself off and refuses to re-advertise. The only way to
+bring it back was to plug it into USB power.
+
+The vendor app does not expose this; it appears to be a factory / RMA
+path. Documented here only so the opcode isn't accidentally reused for
+something else.
+
+### `LIVE_SAMPLES_B` (cmd=0x04) reply header (24 bytes)
+
+Field offsets identified by polling `cmd=0x04` and matching bytes
+against the SpO₂ / HR / battery values shown on the ring's display:
+
+```
+[0..1]   u16 LE  packet counter (increments by 1 per reply)
+[2..4]   bytes   00 00 02      constant in observed traffic
+[5]      u8      ring state flag
+                   0x01 = idle (file commands work)
+                   0x03 = a file handle is open (cmd=0xF1 silently hangs;
+                          see "the F1 wedge" below)
+[6]      u8      SpO₂ percent (matches on-ring display)
+[7]      u8      motion / activity level (≈10 at rest, ≥50 when shaking)
+[8]      u8      heart rate bpm (matches on-ring display)
+[9]      u8      pad (always 0)
+[10]     u8      0x44 constant in our captures (possibly perfusion)
+[11]     u8      secondary motion-correlated counter
+[12]     u8      pad (always 0)
+[13]     u8      battery percent (matches cmd=0xE4 byte[1])
+[14..23] zeros   padding
+[24..25] u16 LE  PPG sample count
+[26..]   bytes   PPG samples (same encoding as cmd=0x03's body)
+```
+
+`cmd=0x03` returns the same waveform body with only a 6-byte preamble
+(`00 00 00 00 <count_lo> <count_hi>`) and no parsed metrics — use
+`cmd=0x04` if you want the live values that the display shows.
 
 ### `SET_UTC_TIME` (cmd=0xC0) payload
 
@@ -451,9 +573,10 @@ end-to-end against a T8520 with firmware `2D010002`:
 4. cmd=0xFF (auth, 16-byte XOR payload, seq=0)            no reply
 5. cmd=0x10 (1-byte 0x00, seq=0)                          0-byte ack
 6. cmd=0xC0 SET_UTC_TIME (8 bytes, seq=1)                 ack
-7. cmd=0x00 (empty, seq=1)                                40-byte fingerprint
-8. cmd=0xF1 GET_FILE_LIST (empty, seq=2)                  count + N × 16-byte slots
-9. For each file:
+7. cmd=0x00 GET_CONFIG (empty, seq=1)                     40-byte config struct
+8. cmd=0xF4 READ_FILE_END (empty, seq=2)                  ack ← clears any phantom open handle
+9. cmd=0xF1 GET_FILE_LIST (empty, seq=3)                  count + N × 16-byte slots
+10. For each file:
      cmd=0xF2 READ_FILE_START (20 bytes, seq=N)           file size + metadata
      loop:
        cmd=0xF3 READ_FILE_DATA (4-byte offset, seq=N+1)   ≤512-byte chunk
@@ -478,6 +601,22 @@ and gets overwritten by F3 chunks starting at offset 40), but it's a
 confusing edge case worth avoiding by ordering the post-auth handshake
 strictly before the file-transfer loop.
 
+### The F1 wedge — always send `cmd=0xF4` before `cmd=0xF1`
+
+After the ring writes its own overnight recording (autonomously, while
+worn — i.e. the typical case for a sync), it leaves a file handle open
+in firmware. While this bit is set, `cmd=0xF1 GET_FILE_LIST` is silently
+dropped — no GATT error, no reply, just a 5 s timeout. The wedge
+survives BLE disconnect/reconnect and persists indefinitely until either
+a ring power-cycle or an explicit `cmd=0xF4 READ_FILE_END`.
+
+`cmd=0xF4` is a no-op when nothing is open, so sending it unconditionally
+at the top of every sync is safe and avoids the wedge entirely.
+
+The state is also observable in `cmd=0x04`'s 24-byte header at offset
+[5]: `0x01` means idle, `0x03` means a file handle is open. (See the
+`LIVE_SAMPLES_B` header layout above.) Verified on firmware `2D010001`.
+
 ## Stored-file format
 
 Two SpO2-recording formats are seen in the wild from this device family:
@@ -492,7 +631,9 @@ Header (10 bytes):
 
 Body (3 bytes per record):
   byte 0  spo2 (percent, 0–100, 0 = invalid)
-  byte 1  heart rate (bpm, 0 = invalid)
+  byte 1  heart rate (bpm, 0 = invalid; firmware also emits 0xFF / 255
+          as a no-finger-contact sentinel — clamp HR to ~25..220, or a
+          255 spike appears in charts at session edges)
   byte 2  status flags (low bits = invalid/motion/etc; nonzero = sample
           should be treated as suspect)
 ```
@@ -574,17 +715,20 @@ that uses [Bumble](https://github.com/google/bumble) to pull all stored
 recordings off a ring. Roughly 300 lines including BLE connection
 plumbing.
 
+[`example_config.py`](./example_config.py) demonstrates `cmd=0x00
+GET_CONFIG` (decoded against the layout above) and, behind an opt-in
+`--set-brightness` flag, `cmd=0x01 SET_CONFIG` for the brightness
+field. Read-only by default.
+
 ## Open questions
 
 A handful of fields are observed but their meaning is not verified.
 Listed here so re-implementers can treat them as opaque rather than
 guessing:
 
-- **`cmd=0x10` and `cmd=0x00` semantics.** Both are required in the
-  post-auth handshake — skip them and `cmd=0xF2` is silently rejected
-  — but their payloads carry no obvious information. `cmd=0x00`'s
-  40-byte reply is byte-identical across sessions on a given device,
-  consistent with a fixed device fingerprint rather than session state.
+- **`cmd=0x10` semantics.** Required in the post-auth handshake — skip
+  it and `cmd=0xF2` is silently rejected — but the 1-byte `0x00` payload
+  carries no obvious information.
 - **Byte 7 of `SET_UTC_TIME`.** Both `0xCE` (what the vendor app sends)
   and `0x00` are accepted with no observable difference in display,
   filename format, or RTC behavior. Treat as unused.
